@@ -1,0 +1,14 @@
+{
+  "decoder": "192.168.0.233",
+  "webPort": 80,
+  "streamPort": 8001,
+  "port": 8080,
+  "openBrowser": true,
+  "source": "auto",
+  "bouquet": "Polskie",
+  "playlist": "playlist.m3u8",
+  "transcode": true,
+  "ffmpeg": null,
+  "videoPreset": "veryfast",
+  "audioBitrate": "128k"
+}

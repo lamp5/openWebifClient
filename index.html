@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TV</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div id="bwrap" style="display:none"><select id="bsel" title="Bukiet"></select></div>
+    <div id="tools">
+      <input id="q" placeholder="Szukaj kanału…" autocomplete="off">
+      <label class="btn" title="Wczytaj inny plik m3u/m3u8">Plik<input id="file" type="file" accept=".m3u,.m3u8,.txt" hidden></label>
+      <button id="gear" title="Ustawienia i skórki">⚙</button>
+    </div>
+    <div id="list"></div>
+  </aside>
+  <main id="main">
+    <video id="v" controls autoplay></video>
+    <div id="toast"></div>
+    <button id="etoggle" title="Pokaż/ukryj EPG (E)">EPG</button>
+    <div id="bar"><b id="title"></b><div id="now"></div><div id="msg"></div></div>
+  </main>
+  <aside id="epg"><div id="epgh">Program</div><div id="etabs"><button class="on" data-t="prog">Program</button><button data-t="find">Szukaj</button></div>
+    <div id="epglist"></div>
+    <div id="find"><div id="fbar"><input id="fq" placeholder="Szukaj w EPG (np. mecz, film)…" autocomplete="off"></div><div id="fres"></div></div></aside>
+</div>
+
+<dialog id="dlg"><h3>Ustawienia</h3><div id="sfields"></div>
+  <div class="f"><label>Skórka</label><select id="theme"></select></div>
+  <div class="f"><label>Kolor akcentu</label><span><input type="color" id="accent"> <button type="button" id="accrst">Domyślny</button></span></div>
+  <div id="smsg"></div>
+  <div class="sb"><button type="button" id="stest">Testuj połączenie</button><span style="flex:1"></span><button type="button" id="scancel">Zamknij</button><button type="button" id="ssave">Zapisz</button></div>
+</dialog>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('v'), listEl = $('list');
+let channels = [], current = -1, player = null, shown = [];
+let io = null;
+let favs = new Set(); try { favs = new Set(JSON.parse(localStorage.getItem('favs') || '[]')); } catch {}
+function toggleFav(url) { favs.has(url) ? favs.delete(url) : favs.add(url); try { localStorage.setItem('favs', JSON.stringify([...favs])); } catch {} render(); }
+
+// Strumienie i picony z LAN lecą przez lokalny proxy (omija CORS)
+const viaProxy = (u, prog) => location.protocol.startsWith('http') ? location.origin + '/proxy?u=' + encodeURIComponent(u) + (prog ? '&program=' + prog : '') : u;
+
+function parseM3U(text) {
+  const out = []; let meta = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (l.startsWith('#EXTINF')) {
+      const attr = k => (l.match(new RegExp(k + '="([^"]*)"')) || [])[1] || '';
+      meta = { name: l.slice(l.lastIndexOf(',') + 1).trim() || attr('tvg-name'),
+               logo: attr('tvg-logo'), no: attr('tvg-chno'), program: attr('tvg-chno'), group: attr('group-title') };
+    } else if (l.startsWith('#EXTVLCOPT:program=')) {
+      if (meta) meta.program = l.split('=')[1].trim();
+    } else if (l && !l.startsWith('#')) {
+      out.push({ ...(meta || { name: l, logo: '', no: '', group: '' }), url: l }); meta = null;
+    }
+  }
+  return out;
+}
+
+function render() {
+  const q = $('q').value.trim().toLowerCase();
+  shown = channels.map((c, i) => ({ c, i })).filter(x => !q || x.c.name.toLowerCase().includes(q)).sort((a, b) => favs.has(b.c.url) - favs.has(a.c.url));
+  listEl.innerHTML = '';
+  if (io) io.disconnect();
+  io = new IntersectionObserver(es => es.forEach(en => { if (en.isIntersecting) { io.unobserve(en.target); queueNow(en.target._c, en.target._np); } }), { root: listEl, rootMargin: '100px' });
+  if (!shown.length) { listEl.innerHTML = '<div id="empty">Brak kanałów.</div>'; return; }
+  const frag = document.createDocumentFragment();
+  for (const { c, i } of shown) {
+    const d = document.createElement('div');
+    d.className = 'ch' + (i === current ? ' on' : ''); d.dataset.i = i;
+    const img = document.createElement('img'); img.loading = 'lazy'; img.alt = '';
+    const logos = c.logos || (c.logo ? [c.logo] : []); let k = 0;   // próbuje kolejnych adresów piconu
+    img.onerror = () => next();
+    const next = () => { if (k < logos.length) img.src = viaProxy(logos[k++]); else img.style.visibility = 'hidden'; };
+    next();
+    const n = document.createElement('div'); n.className = 'n';
+    const t1 = el('div'); t1.append(el('span', 'no', (i + 1) + ' '), c.name);
+    const np = el('div', 'np'); n.append(t1, np);
+    const st = document.createElement('span'); st.className = 'st' + (favs.has(c.url) ? ' on' : ''); st.textContent = '★'; st.title = 'Ulubione';
+    st.onclick = e => { e.stopPropagation(); toggleFav(c.url); };
+    d.append(img, n, st);
+    d.onclick = () => play(i);
+    d._c = c; d._np = np; io.observe(d);
+    frag.appendChild(d);
+  }
+  listEl.appendChild(frag);
+}
+
+function stop() {
+  if (player) { try { player.pause(); player.unload(); player.detachMediaElement(); player.destroy(); } catch {} player = null; }
+}
+
+function play(i) {
+  if (i < 0 || i >= channels.length) return;
+  const c = channels[i]; current = i;
+  stop(); $('msg').textContent = ''; $('title').textContent = c.name;
+  document.querySelectorAll('.ch.on').forEach(e => e.classList.remove('on'));
+  const row = listEl.querySelector(`.ch[data-i="${i}"]`);
+  if (row) { row.classList.add('on'); row.scrollIntoView({ block: 'nearest' }); }
+  try { localStorage.setItem('lastCh', c.url); } catch {}
+  loadEpg(c);
+
+  if (!mpegts.getFeatureList().mseLivePlayback) { $('msg').textContent = 'Ta przeglądarka nie obsługuje MSE – użyj Chrome/Edge/Firefox.'; return; }
+  player = mpegts.createPlayer({ type: 'mpegts', isLive: true, url: viaProxy(c.url, c.program) }, {
+    enableWorker: true, liveBufferLatencyChasing: true,
+    liveBufferLatencyMaxLatency: 6, liveBufferLatencyMinRemain: 1.5, lazyLoad: false
+  });
+  player.attachMediaElement(video);
+  player.on(mpegts.Events.ERROR, (type, detail, info) => {
+    const ve = video.error;
+    console.warn('mpegts error:', type, detail, info, '| video.error:', ve && ve.code, ve && ve.message);
+    if (ve) { $('msg').textContent = 'Błąd odtwarzacza (kod ' + ve.code + '): ' + (ve.message || 'brak opisu'); return; }
+    $('msg').textContent = 'Błąd: ' + type + ' / ' + detail + (info && info.msg ? ' – ' + info.msg : '') +
+      (/Codec|Unsupported/i.test(detail + (info && info.msg || '')) ? ' (prawdopodobnie kodek HEVC/AC3/MP2).' :
+       ' – sprawdź, czy dekoder jest włączony i czy tuner jest wolny.');
+  });
+  player.load();
+  const p = player.play(); if (p && p.catch) p.catch(() => {});
+}
+
+const webBase = c => c.web || ('http://' + new URL(c.url).hostname);   // adres OpenWebif (EPG, timery)
+let all = [];
+function setChannels(list, defB) {
+  all = list;
+  const bq = [...new Set(list.map(c => c.bouquet).filter(Boolean))], sel = $('bsel');
+  sel.textContent = '';
+  sel.append(new Option('Wszystkie (' + new Set(list.map(c => c.url)).size + ')', ''));
+  bq.forEach(b => sel.append(new Option(b + ' (' + list.filter(c => c.bouquet === b).length + ')', b)));
+  $('bwrap').style.display = bq.length ? '' : 'none';
+  let want = null; try { want = localStorage.getItem('bouquet'); } catch {}
+  if (want == null) want = defB ? (bq.find(b => b.toLowerCase().includes(String(defB).toLowerCase())) || '') : '';
+  sel.value = (want === '' || bq.includes(want)) ? want : '';
+  applyBouquet();
+}
+function applyBouquet() {
+  const b = $('bsel').value; try { localStorage.setItem('bouquet', b); } catch {}
+  const playing = channels[current] && channels[current].url, seen = new Set();
+  channels = all.filter(c => (!b || c.bouquet === b) && !seen.has(c.url) && seen.add(c.url));
+  current = playing ? channels.findIndex(c => c.url === playing) : -1;
+  render();
+}
+$('bsel').addEventListener('change', () => { applyBouquet(); $('bsel').blur(); });
+function showLast() {
+  let last = ''; try { last = localStorage.getItem('lastCh') || ''; } catch {}
+  const idx = channels.findIndex(c => c.url === last);
+  if (idx >= 0) $('title').textContent = 'Ostatnio: ' + channels[idx].name;   // autoplay bywa blokowany – start po kliknięciu
+}
+function load(text) { setChannels(parseM3U(text)); showLast(); }
+
+video.addEventListener('error', () => {
+  const e = video.error; if (!e) return;
+  $('msg').textContent = 'Błąd odtwarzacza (kod ' + e.code + '): ' + (e.message || '') + ' – szczegóły w konsoli serwera.';
+  console.warn('video.error', e.code, e.message);
+});
+
+// ---- EPG (OpenWebif: /api/epgservice na dekoderze, przez proxy) ----
+let epgEvents = [], epgSeq = 0, epgFetched = 0, epgMsg = '';
+const dec = s => { const f = x => { const t = document.createElement('textarea'); t.innerHTML = x || ''; return t.value; }; const a = f(s); return /&(amp|quot|lt|gt|#\d+);/.test(a) ? f(a) : a; };
+const hm = ts => new Date(ts * 1000).toLocaleTimeString('pl', { hour: '2-digit', minute: '2-digit' });
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+async function loadEpg(c) {
+  const seq = ++epgSeq; epgEvents = []; epgMsg = 'Ładowanie EPG…'; renderEpg(c);
+  if (!location.protocol.startsWith('http')) { epgMsg = 'EPG wymaga uruchomienia przez server.js'; renderEpg(c); return; }
+  try {
+    const u = new URL(c.url), sref = decodeURIComponent(u.pathname.slice(1));
+    const r = await fetch(viaProxy(webBase(c) + '/api/epgservice?sRef=' + encodeURIComponent(sref)));
+    const j = await r.json(); if (seq !== epgSeq) return;
+    epgEvents = (j.events || []).filter(e => e.begin_timestamp != null && e.duration_sec != null)
+      .map(e => ({ id: e.id, sr: e.sref, b: e.begin_timestamp, e: e.begin_timestamp + e.duration_sec, t: dec(e.title), s: dec(e.shortdesc), l: dec(e.longdesc) }))
+      .sort((a, b) => a.b - b.b);
+    epgFetched = Date.now(); epgMsg = 'Brak danych EPG dla tego kanału.';
+  } catch (err) { if (seq !== epgSeq) return; epgMsg = 'Brak EPG (' + err.message + ')'; }
+  renderEpg(c);
+}
+
+function renderEpg(c) {
+  c = c || channels[current]; if (!c) return;
+  const now = Date.now() / 1000, ev = epgEvents.filter(e => e.e > now);
+  const cur = ev.find(e => e.b <= now), nxt = ev.find(e => e.b > now);
+  $('epgh').textContent = c.name;
+  const nowEl = $('now'); nowEl.textContent = '';
+  if (cur) {
+    nowEl.append(el('div', '', '▶ ' + hm(cur.b) + '–' + hm(cur.e) + '  ' + cur.t));
+    const pb = el('div', 'pb'), bar = el('i'); bar.style.width = Math.min(100, Math.max(0, (now - cur.b) / (cur.e - cur.b) * 100)) + '%'; pb.append(bar); nowEl.append(pb);
+    if (nxt) nowEl.append(el('div', 'nx', 'Następnie: ' + hm(nxt.b) + '  ' + nxt.t));
+  }
+  const box = $('epglist'), open = new Set([...box.querySelectorAll('.ev.open')].map(x => x.dataset.b));
+  box.textContent = '';
+  if (!ev.length) { box.append(el('div', 'empty', epgMsg)); return; }
+  for (const e of ev.slice(0, 40)) {
+    const d = el('div', 'ev' + (e === cur ? ' cur' : '')); d.dataset.b = e.b;
+    const top = el('div'); const rec = el('button', 'rec', '● Nagraj'); rec.title = 'Dodaj timer nagrywania w dekoderze';
+    rec.onclick = ev => { ev.stopPropagation(); recordEvent(c, e); };
+    top.append(el('span', 'tm', hm(e.b)), el('span', '', e.t), rec); d.append(top);
+    if (e === cur) { const pb = el('div', 'pb'), bar = el('i'); bar.style.width = Math.min(100, (now - e.b) / (e.e - e.b) * 100) + '%'; pb.append(bar); d.append(pb); }
+    if (e.s) d.append(el('div', 'sd', e.s));
+    if (e.l) d.append(el('div', 'ld', e.l));
+    if (open.has(String(e.b))) d.classList.add('open');
+    d.onclick = () => d.classList.toggle('open');
+    box.append(d);
+  }
+}
+setInterval(() => {
+  if (current < 0) return; renderEpg();
+  const now = Date.now() / 1000, cur = epgEvents.find(e => e.b <= now && e.e > now), age = Date.now() - epgFetched;
+  if (age > 600000 || (!cur && age > 60000)) loadEpg(channels[current]);
+}, 30000);
+$('etoggle').onclick = () => $('app').classList.toggle('noepg');
+let toastT, numBuf = '', numT;
+function toast(m, ms = 3000) { const t = $('toast'); t.textContent = m; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms); }
+function zapNum() { const n = parseInt(numBuf, 10); numBuf = ''; if (n >= 1 && n <= channels.length) play(n - 1); else toast('Brak kanału ' + n); }
+
+// "Teraz leci" przy kanałach: leniwie (tylko widoczne wiersze), max 4 zapytania naraz, cache 3 min
+const nowCache = new Map(); const nowQ = []; let nowBusy = 0;
+function queueNow(c, t2) { nowQ.push([c, t2]); pumpNow(); }
+function pumpNow() {
+  while (nowBusy < 4 && nowQ.length) {
+    const [c, t2] = nowQ.shift(); nowBusy++;
+    fetchNow(c).then(ev => { if (ev && ev.e > Date.now() / 1000 && t2.isConnected) t2.textContent = hm(ev.b) + '  ' + ev.t; })
+      .finally(() => { nowBusy--; pumpNow(); });
+  }
+}
+async function fetchNow(c) {
+  const hit = nowCache.get(c.url); if (hit && Date.now() - hit.t < 180000) return hit.ev;
+  if (!location.protocol.startsWith('http')) return null;
+  try {
+    const u = new URL(c.url), sref = decodeURIComponent(u.pathname.slice(1));
+    const j = await (await fetch(viaProxy(webBase(c) + '/api/epgservicenow?sRef=' + encodeURIComponent(sref)))).json();
+    const e = (j.events || [])[0];
+    const ev = e && e.begin_timestamp != null ? { b: e.begin_timestamp, e: e.begin_timestamp + e.duration_sec, t: dec(e.title) } : null;
+    nowCache.set(c.url, { t: Date.now(), ev }); return ev;
+  } catch { return null; }
+}
+
+// Nagrywanie = timer w dekoderze (OpenWebif timeraddbyeventid); plik ląduje na dysku dekodera
+async function recordEvent(c, e) {
+  if (!confirm('Nagrać „' + e.t + '” (' + hm(e.b) + '–' + hm(e.e) + ') na dekoderze?')) return;
+  try {
+    const u = new URL(c.url), sref = e.sr || decodeURIComponent(u.pathname.slice(1));
+    const j = await (await fetch(viaProxy(webBase(c) + '/api/timeraddbyeventid?sRef=' + encodeURIComponent(sref) + '&eventid=' + e.id + '&justplay=0'))).json();
+    toast((j.result ? '✔ ' : '✖ ') + (j.message || (j.result ? 'Timer dodany' : 'Nie udało się dodać timera')), 5000);
+  } catch (err) { toast('✖ Timer nie dodany: ' + err.message, 5000); }
+}
+
+// ---- skórki ----
+const THEMES = { dark: 'Ciemny', light: 'Jasny', amoled: 'AMOLED (czarny)', navy: 'Granat', amber: 'Bursztyn' };
+function applyTheme() {
+  let t = 'dark', a = ''; try { t = localStorage.getItem('theme') || 'dark'; a = localStorage.getItem('accent') || ''; } catch {}
+  document.documentElement.dataset.theme = t;
+  a ? document.documentElement.style.setProperty('--acc', a) : document.documentElement.style.removeProperty('--acc');
+}
+applyTheme();
+
+// ---- ustawienia (zapis do config.json przez serwer) ----
+const FIELDS = [
+  ['decoder', 'Adres IP dekodera', 'text'], ['webPort', 'Port OpenWebif', 'number'], ['streamPort', 'Port strumieni', 'number'],
+  ['source', 'Źródło kanałów', 'select', { auto: 'dekoder, zapas: plik', decoder: 'tylko dekoder', playlist: 'tylko plik playlisty' }],
+  ['bouquet', 'Domyślny bukiet (fragment nazwy)', 'text'], ['transcode', 'Przekoduj obraz (gdy się zawiesza)', 'check'],
+  ['videoPreset', 'Preset x264', 'select', { ultrafast: 'ultrafast (najmniej CPU)', veryfast: 'veryfast', fast: 'fast', medium: 'medium (najlepsza jakość)' }],
+  ['audioBitrate', 'Bitrate dźwięku', 'select', { '96k': '96k', '128k': '128k', '192k': '192k', '256k': '256k' }],
+  ['openBrowser', 'Otwieraj przeglądarkę po starcie', 'check'], ['port', 'Port aplikacji (wymaga restartu)', 'number'], ['ffmpeg', 'Ścieżka do ffmpeg (wymaga restartu)', 'text'],
+];
+const smsg = (t, ok) => { $('smsg').textContent = t; $('smsg').style.color = ok === true ? '#4caf50' : ok === false ? '#ff6b6b' : ''; };
+const field = k => $('sfields').querySelector('[name=' + k + ']');
+function collect() {
+  const o = {};
+  for (const [k, , type] of FIELDS) { const f = field(k); o[k] = type === 'check' ? f.checked : type === 'number' ? parseInt(f.value, 10) : f.value.trim(); }
+  return o;
+}
+async function openSettings() {
+  const box = $('sfields'); box.textContent = ''; smsg('');
+  let st; try { st = await (await fetch('/settings')).json(); } catch { toast('Ustawienia wymagają uruchomienia przez server.js', 4000); return; }
+  for (const [k, label, type, opts] of FIELDS) {
+    const row = el('div', 'f'), lab = el('label', '', label); let f;
+    if (type === 'select') { f = document.createElement('select'); for (const [v, t] of Object.entries(opts)) f.append(new Option(t, v)); }
+    else { f = document.createElement('input'); f.type = type === 'check' ? 'checkbox' : type; }
+    f.name = k; f.disabled = !st.canEdit;
+    const val = st.cfg[k]; type === 'check' ? f.checked = !!val : f.value = val == null ? '' : val;
+    row.append(lab, f); box.append(row);
+  }
+  $('ssave').disabled = $('stest').disabled = !st.canEdit;
+  if (!st.canEdit) smsg('Ustawienia serwera można zmieniać tylko z komputera, na którym działa aplikacja.', false);
+  else if (st.cliTranscode) smsg('Uwaga: tryb przekodowania jest wymuszony flagą uruchomienia (--transcode / --no-transcode).');
+  const th = $('theme'); th.textContent = ''; for (const [v, t] of Object.entries(THEMES)) th.append(new Option(t, v));
+  let cur = 'dark', acc = ''; try { cur = localStorage.getItem('theme') || 'dark'; acc = localStorage.getItem('accent') || ''; } catch {}
+  th.value = cur; $('accent').value = acc || getComputedStyle(document.documentElement).getPropertyValue('--acc').trim() || '#4da3ff';
+  $('dlg').showModal();
+}
+$('gear').onclick = openSettings;
+$('scancel').onclick = () => $('dlg').close();
+$('theme').onchange = () => { try { localStorage.setItem('theme', $('theme').value); localStorage.removeItem('accent'); } catch {} applyTheme(); $('accent').value = getComputedStyle(document.documentElement).getPropertyValue('--acc').trim(); };
+$('accent').oninput = () => { try { localStorage.setItem('accent', $('accent').value); } catch {} applyTheme(); };
+$('accrst').onclick = () => { try { localStorage.removeItem('accent'); } catch {} applyTheme(); $('accent').value = getComputedStyle(document.documentElement).getPropertyValue('--acc').trim(); };
+$('stest').onclick = async () => {
+  const o = collect(); smsg('Łączę…');
+  try { const j = await (await fetch('/settings/test?host=' + encodeURIComponent(o.decoder) + '&port=' + o.webPort)).json(); j.ok ? smsg('✔ ' + j.model, true) : smsg('✖ ' + j.error, false); }
+  catch (e) { smsg('✖ ' + e.message, false); }
+};
+$('ssave').onclick = async () => {
+  try {
+    const r = await fetch('/settings', { method: 'POST', body: JSON.stringify(collect()) }), j = await r.json();
+    if (!r.ok) { smsg('✖ ' + j.error, false); return; }
+    smsg(j.restart.length ? '✔ Zapisano w config.json. Zmiany w: ' + j.restart.join(', ') + ' zadziałają po restarcie serwera.' : '✔ Zapisano w config.json.', true);
+    all = []; boot();
+  } catch (e) { smsg('✖ ' + e.message, false); }
+};
+
+// ---- wyszukiwarka EPG (OpenWebif /api/epgsearch) ----
+function tune(c) {
+  let i = channels.findIndex(x => x.url === c.url);
+  if (i < 0) { $('bsel').value = ''; applyBouquet(); i = channels.findIndex(x => x.url === c.url); }
+  if (i >= 0) play(i);
+}
+$('etabs').addEventListener('click', e => {
+  const t = e.target.dataset && e.target.dataset.t; if (!t) return;
+  $('epg').classList.toggle('find', t === 'find');
+  document.querySelectorAll('#etabs button').forEach(b => b.classList.toggle('on', b === e.target));
+  if (t === 'find') $('fq').focus();
+});
+let fTimer;
+$('fq').addEventListener('input', () => { clearTimeout(fTimer); fTimer = setTimeout(() => epgSearch($('fq').value.trim()), 400); });
+async function epgSearch(q) {
+  const box = $('fres'); box.textContent = ''; if (q.length < 2 || !all.length) return;
+  box.append(el('div', 'empty', 'Szukam…'));
+  try {
+    const j = await (await fetch(viaProxy(webBase(all[0]) + '/api/epgsearch?search=' + encodeURIComponent(q)))).json();
+    const map = new Map(); for (const c of all) { try { map.set(decodeURIComponent(new URL(c.url).pathname.slice(1)), c); } catch {} }
+    const now = Date.now() / 1000;
+    const evs = (j.events || []).filter(e => e.begin_timestamp != null && e.begin_timestamp + e.duration_sec > now).sort((a, b) => a.begin_timestamp - b.begin_timestamp).slice(0, 80);
+    box.textContent = '';
+    if (!evs.length) { box.append(el('div', 'empty', 'Brak wyników.')); return; }
+    for (const r of evs) {
+      const c = map.get(r.sref), ev = { id: r.id, sr: r.sref, b: r.begin_timestamp, e: r.begin_timestamp + r.duration_sec, t: dec(r.title) };
+      const d = el('div', 'ev' + (c ? '' : ' dim')), top = el('div');
+      const day = new Date(ev.b * 1000).toLocaleDateString('pl', { weekday: 'short', day: 'numeric', month: 'numeric' });
+      top.append(el('span', 'tm', day + ' ' + hm(ev.b)), el('span', '', ev.t));
+      if (c) { const rec = el('button', 'rec', '● Nagraj'); rec.onclick = x => { x.stopPropagation(); recordEvent(c, ev); }; top.append(rec); d.onclick = () => tune(c); }
+      d.append(top, el('div', 'ch2', (c ? c.name : dec(r.sname)) + (r.shortdesc ? ' · ' + dec(r.shortdesc) : '')));
+      box.append(d);
+    }
+  } catch (err) { box.textContent = ''; box.append(el('div', 'empty', 'Błąd wyszukiwania: ' + err.message)); }
+}
+$('q').addEventListener('input', render);
+$('file').addEventListener('change', e => { const f = e.target.files[0]; if (f) f.text().then(load); });
+
+// Klawiatura: ↑/↓ zmiana kanału, F pełny ekran, M wyciszenie
+document.addEventListener('keydown', e => {
+  if (e.target.closest && e.target.closest('input,select,textarea,dialog') && e.key !== 'Escape') return;
+  if (/^\d$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey) { numBuf = (numBuf + e.key).slice(0, 4); toast('Kanał: ' + numBuf + '…', 1600); clearTimeout(numT); numT = setTimeout(zapNum, 1600); return; }
+  if (e.key === 'Enter' && numBuf) { clearTimeout(numT); zapNum(); return; }
+  const pos = shown.findIndex(x => x.i === current);
+  if (e.key === 'ArrowDown' && shown.length) { e.preventDefault(); play(shown[Math.min(pos + 1, shown.length - 1)].i); }
+  else if (e.key === 'ArrowUp' && shown.length) { e.preventDefault(); play(shown[Math.max(pos - 1, 0)].i); }
+  else if (e.key === 'f') { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen(); }
+  else if (e.key === 'm') { video.muted = !video.muted; }
+  else if (e.key === 'e') { $('app').classList.toggle('noepg'); }
+});
+video.addEventListener('dblclick', () => document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen());
+
+// Start: spróbuj wczytać playlist.m3u8 z serwera; jeśli się nie da – użyj przycisku "Plik"
+async function boot() {
+  try {                                           // 1) kanały z dekodera (config.json), 2) zapas: plik playlisty
+    const r = await fetch('/channels'), j = await r.json();
+    if (r.ok && j.channels) { setChannels(j.channels, j.defaultBouquet); showLast(); return; }
+    if (j.fallback === false) { listEl.textContent = ''; listEl.append(el('div', 'empty', 'Nie można pobrać kanałów z dekodera: ' + j.error)); return; }
+  } catch {}
+  fetch('/playlist').then(r => r.ok ? r.text() : Promise.reject()).then(load)
+    .catch(() => { listEl.textContent = ''; listEl.append(el('div', 'empty', 'Brak połączenia z dekoderem i pliku playlisty. Wczytaj playlistę przyciskiem „Plik”.')); });
+}
+boot();
+</script>
+</body>
+</html>
